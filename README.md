@@ -10,6 +10,9 @@ Decrypt and extract the voice guidance MP3 prompts from Sony WH-1000XM4 encrypte
 
 The AES-128-CBC key was extracted by dumping the headphones' Airoha MT2811 firmware over Bluetooth Low Energy using the [RACE protocol](https://airoha.com), then disassembling the ARM Cortex-M4 FOTA decryption routine. Full technical writeup: **[docs/WRITEUP.md](docs/WRITEUP.md)**
 
+> [!NOTE]
+> **This fork adds the write path.** Upstream decrypts and extracts the voice prompts. This fork also rebuilds voice packs and **pushes them back to the headphones over Bluetooth**, reverse-engineered from a capture of the official Sony Sound Connect app. See [Writing voice packs back](#writing-voice-packs-back-fork-addition) below.
+
 ## Quick Start
 
 ```bash
@@ -128,14 +131,59 @@ bun run cli/extract.ts --extract-key your_dump.bin
 
 The tool searches the firmware binary for the AES S-box, finds adjacent null-terminated 16-byte ASCII strings, then validates each candidate pair by attempting to decrypt a voice pack and checking for valid LZMA headers.
 
+## Writing voice packs back (fork addition)
+
+Two new tools close the loop from "extract the prompts" to "put new prompts on the headphones."
+
+| Tool | What it does |
+| --- | --- |
+| [`cli/repack.py`](cli/repack.py) | Rebuilds a valid voice-pack `.bin` from 54 `prompt_NN.mp3` files: LZMA1 with Sony's exact settings, AES-128-CBC, TLV container with a fresh SHA-256. `--roundtrip` decodes a real pack and rebuilds it byte-identical. It passes on all 10 languages. |
+| [`cli/push_voice_pack.py`](cli/push_voice_pack.py) | Pushes a `.bin` to a WH-1000XM4 over BLE using the RACE FOTA sequence captured from the real app. **Dry run by default.** `--confirm` plus a typed `yes` is required to write. |
+
+```bash
+# Prove the repacker is lossless (no hardware involved)
+uv run cli/repack.py --roundtrip voice-packs/VP_english_UPG_03.bin
+
+# Build a custom pack from a folder of 54 prompt_NN.mp3 files
+uv run cli/repack.py --build my_prompts/ output/VP_custom.bin voice-packs/VP_english_UPG_03.bin
+
+# Print the push plan without touching Bluetooth
+uv run cli/push_voice_pack.py output/VP_custom.bin
+
+# Real write (headphones connected in macOS Bluetooth, Sound Connect app closed)
+uv run cli/push_voice_pack.py output/VP_custom.bin --confirm
+```
+
+`push_voice_pack.py` needs [race-toolkit](https://github.com/auracast-research/race-toolkit) cloned **next to** this repo, for its `librace` protocol code.
+
+### What it took to match the real app
+
+Confirmed by decoding raw BLE captures byte by byte. Full details in [docs/COMMIT_INVESTIGATION.md](docs/COMMIT_INVESTIGATION.md).
+
+- **Voice packs use the standard RACE FOTA flow,** with four undocumented Sony commands (`0x1c1c`, `0x0433`, `0x0431`, `0x0430`) between `FotaStart` and `FotaStartTransaction`.
+- **Every RACE packet goes out as ATT Write Command,** split by hand at the write-without-response size (239 bytes). A single oversized GATT write makes macOS fall back to long writes, which the headphones reject with `Prepare Queue Full`.
+- **`storage_type=1`, one 256-byte page per write, and `head=0x15`** for every command once the FOTA session starts. race-toolkit's defaults differ on all three.
+- **Two payload fixes:** `FotaIntegrityCheck` needs `01 00 01`, and `FotaCommit` takes an empty payload with type `0x5c`.
+- **The CDN voice packs are stale.** The device's async indication after the integrity check returns `0x0d` for the bundled CDN files and `0x00` for what the app pushes today. Rebuilding a pack from a capture of a real transfer fixed `FotaCommit`. The doc covers how to do that rebuild.
+
+### Safety
+
+Writes only touch the voice-guidance partition (`0x00510000`, about 6 MB of external flash), never the main firmware or bootloader. The worst realistic outcome is garbled or silent prompts, which you fix by pushing an original pack again. Still, this writes flash on real hardware. Use it at your own risk.
+
+[docs/BLE_SNOOP_PLAN.md](docs/BLE_SNOOP_PLAN.md) explains how to capture the official app's traffic on Android or iOS.
+
 ## Project Structure
 
 ```
 ├── cli/
 │   ├── extract.ts          # Bun CLI tool (extract + key finder)
-│   └── extract_key.py      # Python BLE firmware dumper + key finder
+│   ├── extract_key.py      # Python BLE firmware dumper + key finder
+│   ├── repack.py           # Rebuild .bin from MP3 prompts (fork)
+│   └── push_voice_pack.py  # Push .bin to headphones over BLE (fork)
 ├── docs/
-│   └── WRITEUP.md          # Full technical writeup
+│   ├── WRITEUP.md               # Full technical writeup
+│   ├── BLE_SNOOP_PLAN.md        # Capturing the official app's traffic (fork)
+│   └── COMMIT_INVESTIGATION.md  # Debugging FotaCommit, protocol findings (fork)
 ├── voice-packs/            # Downloaded .bin files (gitignored)
 ├── extracted/              # Extracted MP3 prompts (gitignored)
 ├── extract_all.py          # Python alternative extractor
@@ -151,4 +199,4 @@ The voice pack `.bin` files and extracted MP3 prompts are copyrighted by Sony Co
 
 ## License
 
-MIT
+MIT. Original extraction work by [Helge Sverre](https://github.com/HelgeSverre/sony-vp-extract). Write-path additions by [bsmith1698](https://github.com/bsmith1698).

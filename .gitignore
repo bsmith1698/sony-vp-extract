@@ -9,3 +9,8 @@ extracted/
 *.bin
 *.mp3
 firmware_dump.bin
+
+# Local BLE captures and push logs (contain device-specific traffic)
+captures/
+output/
+__pycache__/
